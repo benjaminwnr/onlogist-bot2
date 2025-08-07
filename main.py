@@ -1,88 +1,74 @@
+import asyncio
 import os
-import zipfile
-import glob
-from bs4 import BeautifulSoup
+import datetime
 from telegram import Bot
-from datetime import datetime
+from playwright.async_api import async_playwright
 
-# === CONFIG ===
-MIN_VERGÜTUNG = 400     # Mindestumsatz pro Auftrag in €
-STARTORT = "Cottbus"    # Nur Aufträge ab diesem Ort
-TODAY = datetime.now().strftime("%d.%m.%Y")
-
-# === TELEGRAM ===
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
+STARTORT = "Cottbus Hbf"
+FRUEHESTES_DATUM = datetime.date.today()
+LETZTES_DATUM = FRUEHESTES_DATUM + datetime.timedelta(days=7)
+
+MIN_UMSATZ = 400
+MAX_AUFTRAEGE_PRO_TAG = 3
+TAGE = ["Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag"]
+ABFAHRT_FRUEHESTENS = datetime.time(5, 0)
+ANKUNFT_SPAETESTENS = datetime.time(19, 0)
+
 bot = Bot(token=TELEGRAM_TOKEN)
 
-# === FUNKTIONEN ===
 
-def extract_html_from_zip(zip_path):
-    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-        zip_ref.extractall("unzipped")
-    return glob.glob("unzipped/*.html")
+async def finde_passende_auftraege():
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        context = await browser.new_context()
+        page = await context.new_page()
 
-def parse_html_file(file_path):
-    with open(file_path, 'r', encoding="utf-8") as file:
-        soup = BeautifulSoup(file, "html.parser")
-    return soup.find_all("tr")
+        await page.goto("https://app.onlogist.com")
+        await page.fill("input[name=email]", os.getenv("ONLOGIST_EMAIL"))
+        await page.fill("input[name=password]", os.getenv("ONLOGIST_PASSWORD"))
+        await page.click("button[type=submit]")
+        await page.wait_for_url("**/marketplace")
 
-def filter_auftraege(rows):
-    results = []
-    for row in rows:
-        cells = row.find_all("td")
-        if len(cells) < 6:
-            continue
-        
-        datum = cells[1].get_text(strip=True)
-        ort = cells[2].get_text(strip=True)
-        vergütung_raw = cells[4].get_text(strip=True).replace("€", "").replace(",", ".")
-        auftrag_id = cells[5].get_text(strip=True)
+        await page.wait_for_timeout(3000)
 
-        try:
-            vergütung = float(vergütung_raw)
-        except ValueError:
-            continue
+        alle_auftraege = await page.locator("[data-testid='order-card']").all()
+        passende_auftraege = []
 
-        if STARTORT.lower() in ort.lower() and datum == TODAY and vergütung >= MIN_VERGÜTUNG:
-            ergebnis = f"📦 Auftrag-ID: {auftrag_id}\n📍 Ort: {ort}\n💰 Vergütung: {vergütung:.2f} €\n📅 Datum: {datum}\n"
-            results.append(ergebnis)
-    return results
+        for auftrag in alle_auftraege:
+            text = await auftrag.inner_text()
+            if STARTORT.lower() in text.lower():
+                try:
+                    umsatz_text = text.split("€")[0].split()[-1].replace(",", ".")
+                    umsatz = float(umsatz_text)
+                    if umsatz >= MIN_UMSATZ:
+                        passende_auftraege.append(text)
+                except:
+                    continue
 
-def send_telegram_nachricht(nachrichten_liste):
-    if not nachrichten_liste:
-        bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="⚠️ Heute keine passenden Aufträge gefunden.")
-    else:
-        for nachricht in nachrichten_liste:
-            bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=nachricht)
+        await browser.close()
+        return passende_auftraege
 
-# === HAUPTFUNKTION ===
 
-def main():
-    print(f"📆 Starte Auftragssuche für {TODAY} in {STARTORT}...")
+async def sende_nachricht(text):
+    await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text)
 
-    try:
-        zip_files = glob.glob("*.zip")
-        if not zip_files:
-            print("❌ Keine ZIP-Datei gefunden.")
-            bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="❌ Keine ZIP-Datei zum Verarbeiten gefunden.")
-            return
 
-        html_files = extract_html_from_zip(zip_files[0])
-        alle_rows = []
-        for html_file in html_files:
-            alle_rows.extend(parse_html_file(html_file))
-        
-        gefiltert = filter_auftraege(alle_rows)
-        send_telegram_nachricht(gefiltert)
+async def hauptfunktion():
+    await sende_nachricht(f"🚀 Starte automatische Suche nach Onlogist-Aufträgen ab {STARTORT} für die Woche ab {FRUEHESTES_DATUM.strftime('%d.%m.%Y')}...")
 
-        print(f"✅ {len(gefiltert)} passende Aufträge gefunden und gesendet.")
-        
-    except Exception as e:
-        fehler = f"❌ Fehler beim Verarbeiten:\n{str(e)}"
-        print(fehler)
-        bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=fehler)
+    auftraege = await finde_passende_auftraege()
 
-# === START ===
+    if not auftraege:
+        await sende_nachricht("❌ Es wurden keine passenden Aufträge gefunden.")
+        return
+
+    await sende_nachricht(f"✅ {len(auftraege)} passende Aufträge gefunden:")
+    for auftrag in auftraege:
+        await sende_nachricht(f"\n📦 Auftrag:\n{auftrag}")
+
+
 if __name__ == "__main__":
-    main()
+    asyncio.run(hauptfunktion())
